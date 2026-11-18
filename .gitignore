@@ -15,6 +15,7 @@ logs/
 # Python
 __pycache__/
 .venv/
+.local-pilot/
 venv/
 *.pyc
 .idea/

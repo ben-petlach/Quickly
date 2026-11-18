@@ -6,7 +6,7 @@ from app.models import WEBHOOK_EVENT_TYPES
 
 # Known inbox providers. "resend" is a legacy value still present on old rows
 # (gmail_oauth reverts disconnected Gmail inboxes to it), so it stays allowed.
-INBOX_PROVIDERS = Literal["gmail", "office365", "smtp", "resend"]
+INBOX_PROVIDERS = Literal["gmail", "office365", "smtp", "zapbox", "resend"]
 
 
 class LeadCampaignInfo(BaseModel):
@@ -116,7 +116,7 @@ class InboxCreate(BaseModel):
     email: str
     display_name: str = ""
     max_emails_per_day: int = 50
-    wait_minutes_between: int = 5
+    wait_minutes_between: int = Field(default=5, ge=1)
     max_jitter_seconds: int = 180
     provider: INBOX_PROVIDERS = "gmail"  # gmail | office365 | smtp
     tracking_domain: Optional[str] = None  # custom hostname for tracking links
@@ -129,7 +129,7 @@ class InboxCreate(BaseModel):
 class InboxUpdate(BaseModel):
     display_name: Optional[str] = None
     max_emails_per_day: Optional[int] = None
-    wait_minutes_between: Optional[int] = None
+    wait_minutes_between: Optional[int] = Field(default=None, ge=1)
     max_jitter_seconds: Optional[int] = None
     provider: Optional[INBOX_PROVIDERS] = None
     tracking_domain: Optional[str] = None  # set to "" to clear
@@ -202,7 +202,7 @@ class ConnectUrlRequest(BaseModel):
     provider: str = "gmail"  # gmail | office365 (smtp inboxes need no OAuth)
     display_name: str = ""
     max_per_day: int = 50
-    wait_minutes_between: int = 5
+    wait_minutes_between: int = Field(default=5, ge=1)
     max_jitter_seconds: int = 180
     tracking_domain: Optional[str] = None
     ramp_up_enabled: bool = False

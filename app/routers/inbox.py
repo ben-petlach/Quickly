@@ -224,6 +224,20 @@ async def list_inboxes(db: AsyncSession = Depends(get_db)):
 
 @router.post("", response_model=InboxResponse)
 async def create_inbox(data: InboxCreate, db: AsyncSession = Depends(get_db)):
+    if data.provider == "zapbox":
+        from app.zapbox import list_accounts
+
+        try:
+            accounts = await list_accounts()
+        except Exception as exc:
+            raise HTTPException(502, "Could not verify Zapbox accounts") from exc
+        if not any(
+            account.get("emailAccount", "").lower() == data.email.lower()
+            and account.get("status", "").lower() in {"active", "connected"}
+            for account in accounts
+        ):
+            raise HTTPException(422, "Select an active Zapbox account")
+
     # Normalise tracking domain: strip scheme, paths, whitespace
     td = _normalise_tracking_domain(data.tracking_domain)
     inbox = Inbox(
@@ -247,6 +261,25 @@ async def create_inbox(data: InboxCreate, db: AsyncSession = Depends(get_db)):
     inbox.effective_max_per_day = _compute_effective_limit(inbox)
     await _maybe_complete_ramp_up(inbox, db)
     return inbox
+
+
+@router.get("/zapbox/accounts")
+async def list_zapbox_accounts():
+    from app.zapbox import list_accounts
+
+    try:
+        accounts = await list_accounts()
+    except Exception as exc:
+        raise HTTPException(502, "Could not load Zapbox accounts") from exc
+    return [
+        {
+            "email": account["emailAccount"],
+            "display_name": " ".join(filter(None, (account.get("firstName"), account.get("lastName")))),
+            "status": account.get("status"),
+        }
+        for account in accounts
+        if account.get("emailAccount")
+    ]
 
 
 @router.get("/{inbox_id}", response_model=InboxResponse)

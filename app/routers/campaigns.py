@@ -32,6 +32,7 @@ from app.models import (
     CampaignInbox,
     LeadReply,
     CustomEmailOverride,
+    ZapboxLaunchSnapshot,
 )
 from app.campaign_lead_status import (
     ENROLLMENT_STATUSES,
@@ -63,6 +64,46 @@ from app.queue_logic import reserve_slots_for_new_leads_bulk
 log = logging.getLogger("quickly.routes")
 
 router = APIRouter(prefix="/api/campaigns", tags=["campaigns"])
+
+
+async def _uses_zapbox(db: AsyncSession, campaign_id: int) -> bool:
+    result = await db.execute(
+        select(Inbox.id)
+        .join(CampaignInbox, CampaignInbox.inbox_id == Inbox.id)
+        .where(CampaignInbox.campaign_id == campaign_id, Inbox.provider == "zapbox")
+        .limit(1)
+    )
+    return result.scalar_one_or_none() is not None
+
+
+async def _zapbox_launch_check(db: AsyncSession, campaign_id: int):
+    from app.zapbox_preflight import snapshot_report
+
+    campaign = (
+        await db.execute(select(Campaign).where(Campaign.id == campaign_id))
+    ).scalar_one()
+    rows = (
+        await db.execute(
+            select(CampaignLead, Lead)
+            .join(Lead, Lead.id == CampaignLead.lead_id)
+            .where(CampaignLead.campaign_id == campaign_id)
+        )
+    ).all()
+    approved = []
+    issues = []
+    for enrollment, lead in rows:
+        digest, lead_issues = await snapshot_report(db, enrollment, lead, campaign)
+        approved.append((enrollment.id, digest))
+        issues.extend({"lead_id": lead.id, "email": lead.email, **issue} for issue in lead_issues)
+    return approved, issues
+
+
+@router.get("/{campaign_id}/zapbox-preflight")
+async def zapbox_preflight(campaign_id: int, db: AsyncSession = Depends(get_db)):
+    if not await _uses_zapbox(db, campaign_id):
+        raise HTTPException(400, "Campaign has no Zapbox inbox")
+    approved, issues = await _zapbox_launch_check(db, campaign_id)
+    return {"enrollments_checked": len(approved), "issues": issues}
 
 
 def _apply_campaign_lead_add_options(cl: CampaignLead, lead: Lead, entry: CampaignLeadAdd) -> None:
@@ -199,7 +240,10 @@ async def list_campaigns(db: AsyncSession = Depends(get_db)):
             )
             .where(
                 LeadReply.campaign_id.in_(campaign_ids),
-                CampaignLead.interest_status.notin_(["out_of_office", "auto_reply"]),
+                or_(
+                    CampaignLead.interest_status.is_(None),
+                    CampaignLead.interest_status.notin_(["out_of_office", "auto_reply"]),
+                ),
             )
             .group_by(LeadReply.campaign_id)
         )
@@ -409,7 +453,10 @@ async def get_campaign(campaign_id: int, db: AsyncSession = Depends(get_db)):
         )
         .where(
             LeadReply.campaign_id == campaign_id,
-            CampaignLead.interest_status.notin_(["out_of_office", "auto_reply"]),
+            or_(
+                CampaignLead.interest_status.is_(None),
+                CampaignLead.interest_status.notin_(["out_of_office", "auto_reply"]),
+            ),
         )
     )
     stats["replies"] = res.scalar() or 0
@@ -491,6 +538,7 @@ async def update_campaign(
     if not campaign:
         raise HTTPException(404, "Campaign not found")
     needs_global_recalc = False
+    launching = data.paused is False and campaign.paused
     if data.name is not None:
         campaign.name = data.name
     if data.inbox_ids is not None:
@@ -596,6 +644,12 @@ async def update_campaign(
             await db.flush()
             log.info("Campaign %s timezone changed (%s -> %s); triggering queue recalculation", campaign_id, old_tz, campaign.timezone)
             needs_global_recalc = True
+    if launching and await _uses_zapbox(db, campaign_id):
+        approved, issues = await _zapbox_launch_check(db, campaign_id)
+        if issues:
+            raise HTTPException(400, {"message": "Resolve Zapbox copy before launch", "issues": issues})
+        for enrollment_id, digest in approved:
+            await db.merge(ZapboxLaunchSnapshot(campaign_lead_id=enrollment_id, content_hash=digest))
     await db.flush()
     if needs_global_recalc:
         await db.commit()
@@ -1783,19 +1837,31 @@ async def preview_email(
         preview_is_html = bool(variant.is_html) if variant.is_html is not None else bool(seq.is_html)
         variant_label = variant.label or "Variant"
 
-    from app.sender import render_body, get_lead_data, RenderContext
+    from app.sender import render_body, get_lead_data, RenderContext, unresolved_placeholders
 
     # Build substitution data – fall back to placeholder strings when no lead given.
     lead_data: dict = {"name": "{{name}}", "email": "{{email}}"}
     if data.lead_id:
-        lead_result = await db.execute(select(Lead).where(Lead.id == data.lead_id))
+        lead_result = await db.execute(
+            select(Lead)
+            .join(CampaignLead, CampaignLead.lead_id == Lead.id)
+            .where(Lead.id == data.lead_id, CampaignLead.campaign_id == campaign_id)
+        )
         lead = lead_result.scalar_one_or_none()
-        if lead:
-            lead_data = get_lead_data(lead)
+        if not lead:
+            raise HTTPException(404, "Lead not found in campaign")
+        lead_data = get_lead_data(lead)
 
     render_ctx = RenderContext()  # same {{random: ...}} pick across subject + body
     rendered_body = render_body(preview_body, lead_data, context=render_ctx)
     rendered_subject = render_body(preview_subject, lead_data, context=render_ctx)
+    missing_placeholders = []
+    if data.lead_id:
+        missing = set(unresolved_placeholders(rendered_subject, rendered_body))
+        for field in unresolved_placeholders(preview_subject, preview_body):
+            if field in lead_data and lead_data[field] in (None, ""):
+                missing.add(field)
+        missing_placeholders = sorted(missing)
 
     # Normalise HTML exactly as the send path does so the preview is identical
     # to the delivered email.
@@ -1829,6 +1895,7 @@ async def preview_email(
         "sequence_position": seq.position,
         "variant_label": variant_label,
         "tracking_note": tracking_urls_note,
+        "missing_placeholders": missing_placeholders,
     }
 
 
@@ -1879,6 +1946,8 @@ async def send_test_email(
     inbox = inbox_res.scalar_one_or_none()
     if not inbox:
         raise HTTPException(400, "No inboxes configured for this campaign")
+    if inbox.provider == "zapbox":
+        raise HTTPException(422, "Preview test sends are disabled for Zapbox during the local pilot")
 
     # Resolve the content to send.  Unsaved overrides (passed when the preview
     # modal is open on an unsaved edit) are applied first; an explicit variant
@@ -2338,6 +2407,8 @@ async def bulk_add_leads_to_campaign(
     campaign_obj = campaign_result.scalar_one_or_none()
     if not campaign_obj:
         raise HTTPException(404, "Campaign not found")
+    if not confirm_only and not campaign_obj.paused and await _uses_zapbox(db, campaign_id):
+        raise HTTPException(409, "Pause Zapbox campaign before enrolling contacts")
     match_provider = getattr(campaign_obj, "match_lead_provider", False)
 
     # Check if this campaign has any personalized sequences
@@ -3009,6 +3080,8 @@ async def import_campaign_leads(
     campaign_obj = campaign_result.scalar_one_or_none()
     if not campaign_obj:
         raise HTTPException(404, "Campaign not found")
+    if not confirm_only and not campaign_obj.paused and await _uses_zapbox(db, campaign_id):
+        raise HTTPException(409, "Pause Zapbox campaign before enrolling contacts")
     match_provider = getattr(campaign_obj, "match_lead_provider", False)
 
     # Check if this campaign has any personalized sequences

@@ -9,6 +9,8 @@
 
 <h1 align="center">Quickly — Open-Source Self-Hosted Cold Email Platform</h1>
 
+This fork includes a [local Zapbox pilot](docs/ZAPBOX-PILOT.md).
+
 <p align="center"><strong>A simple, focused cold email platform you host yourself. An open-source clone of Instantly — but free and fully under your control.</strong></p>
 
 <p align="center">

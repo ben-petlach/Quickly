@@ -615,7 +615,7 @@ export default function Unibox() {
 
         <Card className="xl:col-span-2 flex flex-col min-h-0 overflow-hidden">
           {!selectedThread && !threadLoading && (
-            <div className="text-gray-500 text-sm flex-1">Select a conversation to view messages and reply.</div>
+            <div className="text-gray-500 text-sm flex-1">Select a conversation to view messages.</div>
           )}
           {threadLoading && <div className="text-gray-500 text-sm">Loading thread...</div>}
           {threadError && <div className="text-red-600 text-sm">{threadError}</div>}
@@ -735,7 +735,9 @@ export default function Unibox() {
                 </div>
               </div>
 
-              <div className="pt-3 mt-3 border-t border-gray-200 flex items-center justify-between gap-3">
+              {conversations.some(item => item.thread_id === selectedThread.thread_id && item.inbox_id === selectedThread.inbox_id && item.provider === 'zapbox') ? (
+                <p className="pt-3 mt-3 border-t border-gray-200 text-xs text-gray-500">Reply in Zapbox during this pilot.</p>
+              ) : <div className="pt-3 mt-3 border-t border-gray-200 flex items-center justify-between gap-3">
                 <p className="text-xs text-gray-500">
                   {replyOpen ? 'Reply box added at the end of this thread.' : 'Want to continue this thread?'}
                 </p>
@@ -748,7 +750,7 @@ export default function Unibox() {
                 >
                   {replyOpen ? 'Close reply' : 'Reply'}
                 </Button>
-              </div>
+              </div>}
             </>
           )}
         </Card>

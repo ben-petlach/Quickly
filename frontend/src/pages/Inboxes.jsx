@@ -664,6 +664,7 @@ export default function Inboxes() {
   };
   const [form, setForm] = useState(initialForm);
   const [message, setMessage] = useState(null);
+  const [zapboxAccounts, setZapboxAccounts] = useState([]);
   // Generic SMTP / IMAP credentials for the Add form (used when provider === 'smtp')
   const initialSmtpForm = {
     smtp_host: '',
@@ -881,6 +882,13 @@ export default function Inboxes() {
     handleChange(e);
   };
 
+  useEffect(() => {
+    if (!showAdd || form.provider !== 'zapbox') return;
+    api.get('/inboxes/zapbox/accounts')
+      .then(accounts => setZapboxAccounts(accounts.filter(account => account.status?.toLowerCase() === 'active')))
+      .catch(error => setMessage({ type: 'error', text: `Could not load Zapbox accounts: ${error.message}` }));
+  }, [showAdd, form.provider]);
+
   const canSubmit = () => {
     if (form.provider === 'gmail' || form.provider === 'office365') {
       // allow click so user receives an error message if OAuth is not configured
@@ -889,6 +897,7 @@ export default function Inboxes() {
     if (form.provider === 'smtp') {
       return form.email.trim() !== '' && smtpForm.smtp_host.trim() !== '';
     }
+    if (form.provider === 'zapbox') return zapboxAccounts.some(account => account.email === form.email);
     return form.email.trim() !== '';
   };
 
@@ -1687,6 +1696,7 @@ export default function Inboxes() {
                           <option value="gmail">Gmail / Google Workspace</option>
                           <option value="office365">Office 365 / Outlook</option>
                           <option value="smtp">SMTP (any provider)</option>
+                          <option value="zapbox">Zapbox</option>
                         </select>
                       </div>
                       {editing.provider === 'gmail' && <RedirectUriBlock uri={redirectUri} />}
@@ -2151,9 +2161,27 @@ export default function Inboxes() {
                   <option value="gmail">Gmail / Google Workspace</option>
                   <option value="office365">Office 365 / Outlook</option>
                   <option value="smtp">SMTP (any provider)</option>
+                  <option value="zapbox">Zapbox</option>
                 </select>
               </div>
 
+              {form.provider === 'zapbox' && (
+                <div>
+                  <label className="block text-sm font-medium text-gray-700">Connected Zapbox mailbox</label>
+                  <select
+                    value={form.email}
+                    onChange={e => {
+                      const account = zapboxAccounts.find(item => item.email === e.target.value);
+                      setForm(current => ({ ...current, email: account?.email || '', display_name: account?.display_name || '' }));
+                    }}
+                    className="mt-1 block w-full border-gray-300 rounded-md"
+                  >
+                    <option value="">Select mailbox</option>
+                    {zapboxAccounts.map(account => <option key={account.email} value={account.email}>{account.email}</option>)}
+                  </select>
+                  {zapboxAccounts.length === 0 && !message && <p className="mt-1 text-xs text-gray-500">No active Zapbox accounts found.</p>}
+                </div>
+              )}
               {form.provider === 'smtp' && (
                 <div>
                   <label className="block text-sm font-medium text-gray-700">Email address</label>

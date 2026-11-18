@@ -30,6 +30,8 @@ from app.models import (
     Lead,
     Inbox,
     EmailLog,
+    ZapboxSendAttempt,
+    ZapboxLaunchSnapshot,
     LeadReply,
     GmailAccount,
     Office365Account,
@@ -38,7 +40,7 @@ from app.models import (
     Office365Message,
     CustomEmailOverride,
 )
-from app.sender import send_email, render_body, get_lead_data, RenderContext, SendResult, SendFailure, build_quote_html, build_quote_plain, _plain_to_quoted_html, _strip_html_tags
+from app.sender import send_email, render_body, get_lead_data, RenderContext, SendResult, SendFailure, build_quote_html, build_quote_plain, _plain_to_quoted_html, _strip_html_tags, unresolved_placeholders, zapbox_html_body
 from app.email_html import normalize_email_html
 from app.webhooks import fire_webhook_event
 from app.app_settings import get_google_oauth_credentials, get_office365_oauth_credentials
@@ -47,6 +49,63 @@ from app.queue_logic import _parse_time, compute_effective_daily_limit
 from app.campaign_lead_status import campaign_lead_may_receive_sends
 
 log = logging.getLogger(__name__)
+
+
+async def _start_zapbox_attempt(session, inbox, campaign, lead, enrollment, slot, subject, body):
+    """Refresh replies and persist a unique attempt before a Zapbox network call."""
+    if unresolved_placeholders(subject, body):
+        log.warning("Zapbox send held: unresolved variables for lead %s", lead.id)
+        return None
+    from app.unibox import sync_single_inbox
+
+    try:
+        synced = await sync_single_inbox(inbox.id, reason="pre_send")
+    except Exception:
+        log.exception("Zapbox pre-send inbox sync failed for inbox %s", inbox.id)
+        return None
+    if not synced:
+        return None
+    await session.refresh(enrollment)
+    await session.refresh(lead)
+    await session.refresh(inbox)
+    await session.refresh(campaign)
+    if inbox.paused or campaign.paused or not campaign_lead_may_receive_sends(enrollment, lead):
+        return None
+    reply = await session.execute(select(LeadReply.id).where(
+        LeadReply.lead_id == lead.id, LeadReply.campaign_id == campaign.id,
+    ).limit(1))
+    if reply.scalar_one_or_none() is not None:
+        return None
+    snapshot_result = await session.execute(select(ZapboxLaunchSnapshot).where(
+        ZapboxLaunchSnapshot.campaign_lead_id == enrollment.id,
+    ))
+    snapshot = snapshot_result.scalar_one_or_none()
+    if snapshot is None:
+        log.warning("Zapbox send held: launch approval missing for lead %s", lead.id)
+        return None
+    from app.zapbox_preflight import snapshot_hash
+
+    try:
+        current_hash = await snapshot_hash(session, enrollment, lead, campaign)
+    except ValueError:
+        log.warning("Zapbox send held: campaign or contact copy invalid for lead %s", lead.id)
+        return None
+    if snapshot.content_hash != current_hash:
+        log.warning("Zapbox send held: campaign or contact content changed for lead %s", lead.id)
+        return None
+    prior = await session.execute(select(ZapboxSendAttempt.id).where(
+        ZapboxSendAttempt.campaign_lead_id == enrollment.id,
+        ZapboxSendAttempt.sequence_index == slot.sequence_index,
+    ).limit(1))
+    if prior.scalar_one_or_none() is not None:
+        return None
+    attempt = ZapboxSendAttempt(
+        campaign_lead_id=enrollment.id, inbox_id=inbox.id,
+        sequence_index=slot.sequence_index, status="pending",
+    )
+    session.add(attempt)
+    await session.flush()
+    return attempt
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +370,8 @@ async def run_send_job():
                 if o365_account is None:
                     log.warning("Office 365 inbox %s (%s) has no Office365Account — skipping", inbox.id, inbox.email)
                     continue
+            elif inbox.provider == "zapbox":
+                pass
             elif inbox.provider == "smtp":
                 from app.models import SmtpAccount as _SmtpAccount
                 smtp_res = await session.execute(
@@ -838,6 +899,17 @@ async def run_send_job():
                 list_unsub_url = unsub_url if getattr(campaign, 'add_unsubscribe_header', True) else None
                 list_unsub_one_click = bool(getattr(campaign, "add_one_click_unsubscribe", True))
 
+                zapbox_attempt = None
+                if inbox.provider == "zapbox":
+                    zapbox_attempt = await _start_zapbox_attempt(
+                        session, inbox, campaign, lead, cl, slot, subject, send_body,
+                    )
+                    if zapbox_attempt is None:
+                        await session.delete(email_log_entry)
+                        await session.commit()
+                        continue
+                    email_log_entry.body = zapbox_html_body(send_body, is_html)
+
                 # ── phase 3: send ────────────────────────────────────────────
                 # Commit before the network call.  The pre-created EmailLog row
                 # and tracking tokens must exist, but keeping the transaction
@@ -885,6 +957,13 @@ async def run_send_job():
                             smtp_account=smtp_account,
                         )
                     except Exception:
+                        if zapbox_attempt is not None:
+                            zapbox_attempt.status = "unknown"
+                            inbox.paused = True
+                            await session.delete(email_log_entry)
+                            await session.commit()
+                            log.exception("Zapbox send unknown for lead %s; inbox paused", lead.id)
+                            break
                         # ``send_email`` handles the expected failures itself,
                         # so reaching here means an unexpected error.  The
                         # pre-created EmailLog row was already committed above;
@@ -904,6 +983,12 @@ async def run_send_job():
 
                 # ── Handle permanent failure (bounce / auth) ─────────────────
                 if isinstance(result, SendFailure):
+                    if zapbox_attempt is not None:
+                        zapbox_attempt.status = "unknown" if result.error_type == "unknown" else "rejected"
+                        inbox.paused = True
+                        await session.delete(email_log_entry)
+                        await session.commit()
+                        break
                     log.warning(
                         "Permanent send failure for lead_id=%s inbox=%s: [%s] %s",
                         lead.id, inbox.email, result.error_type, result.message,
@@ -967,6 +1052,10 @@ async def run_send_job():
                 # ── success: update log and consume the slot ─────────────────
                 email_log_entry.message_id = result.message_id
                 email_log_entry.thread_id = result.thread_id or prev_thread_id
+                if zapbox_attempt is not None:
+                    zapbox_attempt.status = "sent"
+                    zapbox_attempt.message_id = result.message_id
+                    zapbox_attempt.thread_id = result.thread_id
                 await session.delete(slot)
                 await _update_enrollment_after_send(session, cl, campaign, sequence)
                 sent_this_inbox += 1
@@ -977,7 +1066,7 @@ async def run_send_job():
 
                 # For Gmail: save the sent message to the local mirror so the body
                 # is available for quoting in future follow-up emails.
-                if inbox.provider not in ("office365", "smtp") and email_log_entry.thread_id:
+                if inbox.provider not in ("office365", "smtp", "zapbox") and email_log_entry.thread_id:
                     try:
                         from app.unibox import upsert_sent_message as _upsert_sent_gmail
                         await _upsert_sent_gmail(
@@ -1024,7 +1113,7 @@ async def run_send_job():
 
                 # For SMTP: immediately save the sent message to the local
                 # mirror so it appears in the unibox thread before the next sync.
-                if inbox.provider == "smtp" and email_log_entry.thread_id:
+                if inbox.provider in ("smtp", "zapbox") and email_log_entry.thread_id:
                     try:
                         from app.unibox import upsert_sent_smtp_message
                         await upsert_sent_smtp_message(
@@ -1035,8 +1124,8 @@ async def run_send_job():
                             subject=subject,
                             to_email=lead.email,
                             from_email=inbox.email,
-                            body=send_body,
-                            is_html=is_html,
+                            body=email_log_entry.body if inbox.provider == "zapbox" else send_body,
+                            is_html=True if inbox.provider == "zapbox" else is_html,
                         )
                     except Exception:
                         log.exception(
@@ -1284,6 +1373,8 @@ async def send_slot_job(slot_id: int) -> None:
                     inbox.email, slot_id,
                 )
                 return
+        elif inbox.provider == "zapbox":
+            pass
         elif inbox.provider == "smtp":
             from app.models import SmtpAccount as _SmtpAccount2
             smtp_res = await session.execute(
@@ -1652,6 +1743,17 @@ async def send_slot_job(slot_id: int) -> None:
         list_unsub_url = unsub_url if getattr(campaign, "add_unsubscribe_header", True) else None
         list_unsub_one_click = bool(getattr(campaign, "add_one_click_unsubscribe", True))
 
+        zapbox_attempt = None
+        if inbox.provider == "zapbox":
+            zapbox_attempt = await _start_zapbox_attempt(
+                session, inbox, campaign, lead, cl, slot, subject, send_body,
+            )
+            if zapbox_attempt is None:
+                await session.delete(email_log_entry)
+                await session.commit()
+                return
+            email_log_entry.body = zapbox_html_body(send_body, is_html)
+
         # ── Send ──────────────────────────────────────────────────────────
         # Commit before the network call.  The pre-created EmailLog row and
         # tracking tokens must exist, but keeping the transaction open across
@@ -1697,6 +1799,13 @@ async def send_slot_job(slot_id: int) -> None:
                     smtp_account=smtp_account,
                 )
             except Exception:
+                if zapbox_attempt is not None:
+                    zapbox_attempt.status = "unknown"
+                    inbox.paused = True
+                    await session.delete(email_log_entry)
+                    await session.commit()
+                    log.exception("Zapbox send unknown for slot %s; inbox paused", slot_id)
+                    return
                 # Unexpected error from send_email: the pre-created EmailLog row
                 # was committed before the network call.  Drop it so it does not
                 # consume daily quota / count as a sent campaign step, then let
@@ -1712,6 +1821,12 @@ async def send_slot_job(slot_id: int) -> None:
 
         # ── Permanent failure ─────────────────────────────────────────────
         if isinstance(result, SendFailure):
+            if zapbox_attempt is not None:
+                zapbox_attempt.status = "unknown" if result.error_type == "unknown" else "rejected"
+                inbox.paused = True
+                await session.delete(email_log_entry)
+                await session.commit()
+                return
             log.warning(
                 "send_slot_job: permanent failure for lead_id=%s inbox=%s: [%s] %s",
                 lead.id, inbox.email, result.error_type, result.message,
@@ -1765,10 +1880,14 @@ async def send_slot_job(slot_id: int) -> None:
         # ── Success ───────────────────────────────────────────────────────
         email_log_entry.message_id = result.message_id
         email_log_entry.thread_id = result.thread_id or prev_thread_id
+        if zapbox_attempt is not None:
+            zapbox_attempt.status = "sent"
+            zapbox_attempt.message_id = result.message_id
+            zapbox_attempt.thread_id = result.thread_id
         await session.delete(slot)
         await _update_enrollment_after_send(session, cl, campaign, sequence)
 
-        if inbox.provider not in ("office365", "smtp") and email_log_entry.thread_id:
+        if inbox.provider not in ("office365", "smtp", "zapbox") and email_log_entry.thread_id:
             try:
                 from app.unibox import upsert_sent_message as _upsert_sent_gmail
                 await _upsert_sent_gmail(
@@ -1809,7 +1928,7 @@ async def send_slot_job(slot_id: int) -> None:
                     "inbox_id=%s lead=%s", inbox.id, lead.email,
                 )
 
-        if inbox.provider == "smtp" and email_log_entry.thread_id:
+        if inbox.provider in ("smtp", "zapbox") and email_log_entry.thread_id:
             try:
                 from app.unibox import upsert_sent_smtp_message
                 await upsert_sent_smtp_message(
@@ -1820,8 +1939,8 @@ async def send_slot_job(slot_id: int) -> None:
                     subject=subject,
                     to_email=lead.email,
                     from_email=inbox.email,
-                    body=send_body,
-                    is_html=is_html,
+                    body=email_log_entry.body if inbox.provider == "zapbox" else send_body,
+                    is_html=True if inbox.provider == "zapbox" else is_html,
                 )
             except Exception:
                 log.exception(

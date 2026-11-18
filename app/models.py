@@ -345,6 +345,32 @@ class QueueSlot(Base):
     variant = relationship("SequenceVariant", foreign_keys=[variant_id])
 
 
+class ZapboxSendAttempt(Base):
+    """One durable Zapbox submission per enrolled contact and sequence step."""
+
+    __tablename__ = "zapbox_send_attempt"
+    __table_args__ = (
+        UniqueConstraint("campaign_lead_id", "sequence_index", name="uq_zapbox_campaign_step"),
+    )
+    id = Column(Integer, primary_key=True)
+    campaign_lead_id = Column(Integer, ForeignKey("campaign_lead.id", ondelete="CASCADE"), nullable=False)
+    inbox_id = Column(Integer, ForeignKey("inbox.id"), nullable=False)
+    sequence_index = Column(Integer, nullable=False)
+    status = Column(String(16), nullable=False, default="pending")
+    message_id = Column(String(512), nullable=True)
+    thread_id = Column(String(512), nullable=True)
+    created_at = Column(DateTime, default=_utcnow, nullable=False)
+
+
+class ZapboxLaunchSnapshot(Base):
+    """Approved campaign and personalization content for a Zapbox enrollment."""
+
+    __tablename__ = "zapbox_launch_snapshot"
+    campaign_lead_id = Column(Integer, ForeignKey("campaign_lead.id", ondelete="CASCADE"), primary_key=True)
+    content_hash = Column(String(64), nullable=False)
+    created_at = Column(DateTime, default=_utcnow, nullable=False)
+
+
 class EmailLog(Base):
     __tablename__ = "email_log"
     __table_args__ = (

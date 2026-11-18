@@ -186,6 +186,7 @@ async def _next_available_send_time_today(
     The returned datetime is campaign-tz naive; callers must convert to UTC
     via ``_to_utc_naive()`` before persisting.
     """
+    wait_minutes = max(1, wait_minutes)  # Older inbox rows may contain zero.
     start_t = _parse_time(sending_start)
     end_t = _parse_time(sending_end)
     start_min = _time_to_minutes(start_t)

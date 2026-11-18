@@ -123,7 +123,7 @@ async def mark_unibox_thread_read(
     return {"ok": True, "thread_id": thread_id}
 
 
-_SYNC_PROVIDERS = ("gmail", "office365", "smtp")
+_SYNC_PROVIDERS = ("gmail", "office365", "smtp", "zapbox")
 
 
 @router.post("/sync")
@@ -214,6 +214,8 @@ async def send_unibox_email(data: UniboxSendRequest, db: AsyncSession = Depends(
         raise HTTPException(status_code=404, detail="Inbox not found")
 
     provider = inbox.provider or "gmail"
+    if provider == "zapbox":
+        raise HTTPException(status_code=422, detail="Reply in Zapbox during the local pilot")
     gmail_account = None
     o365_account = None
     smtp_account = None

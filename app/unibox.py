@@ -1959,6 +1959,89 @@ async def _sync_inbox_smtp(db: AsyncSession, inbox, reason: str = "") -> set[tup
     return touched
 
 
+def _zapbox_address(value: Any) -> str:
+    if isinstance(value, list):
+        return _zapbox_address(value[0]) if value else ""
+    if isinstance(value, dict):
+        return str(value.get("address") or "").strip().lower()
+    return str(value or "").strip().lower()
+
+
+async def _sync_inbox_zapbox(db: AsyncSession, inbox, reason: str = "") -> set[tuple[int, str]]:
+    """Mirror only conversations already sent by this inbox through a campaign."""
+    from app.zapbox import get_thread
+
+    log_rows = await db.execute(
+        select(EmailLog.thread_id, Lead.email, EmailLog.message_id)
+        .join(Lead, Lead.id == EmailLog.lead_id)
+        .where(
+            EmailLog.inbox_id == inbox.id,
+            EmailLog.thread_id.is_not(None),
+            EmailLog.thread_id != "",
+        )
+        .distinct()
+    )
+    touched: set[tuple[int, str]] = set()
+    expected_by_thread: dict[tuple[str, str], set[str]] = {}
+    for thread_id, lead_email, message_id in log_rows.all():
+        expected_by_thread.setdefault((thread_id, lead_email.lower()), set())
+        if message_id:
+            expected_by_thread[(thread_id, lead_email.lower())].add(message_id)
+
+    for (thread_id, lead_email), expected_ids in expected_by_thread.items():
+        messages = await get_thread(inbox.email, thread_id)
+        if not isinstance(messages, list) or not messages or not expected_ids:
+            raise ValueError(f"Zapbox thread {thread_id} is unavailable for reply verification")
+        sent_visible = any(
+            message.get("threadId") == thread_id
+            and message.get("messageId") in expected_ids
+            and _zapbox_address(message.get("from")) == (inbox.email or "").lower()
+            and lead_email in {
+                _zapbox_address(value) for value in message.get("to") or []
+            }
+            for message in messages
+            if isinstance(message, dict)
+        )
+        if not sent_visible:
+            raise ValueError(f"Zapbox thread {thread_id} lacks the sent campaign message")
+        for message in messages:
+            if not isinstance(message, dict):
+                raise ValueError(f"Zapbox thread {thread_id} contains malformed message data")
+            if message.get("threadId") != thread_id:
+                raise ValueError(f"Zapbox thread {thread_id} contains another thread")
+            sender = _zapbox_address(message.get("from"))
+            if not sender or sender == (inbox.email or "").lower():
+                continue
+            if sender != lead_email:
+                continue
+            message_id = str(message.get("messageId") or "").strip()
+            if not message_id:
+                raise ValueError(f"Zapbox thread {thread_id} contains a message without messageId")
+            body = message.get("body") or {}
+            received_at = message.get("date")
+            if isinstance(received_at, str):
+                received_at = datetime.fromisoformat(received_at.replace("Z", "+00:00")).replace(tzinfo=None)
+            parsed = {
+                "message_id": message_id,
+                "from": sender,
+                "to": [_zapbox_address(value) for value in message.get("to") or []],
+                "subject": message.get("subject") or "",
+                "body_plain": body.get("plain") or "",
+                "body_html": body.get("html") or "",
+                "date": received_at,
+            }
+            _, created, changed = await _process_smtp_inbound_message(
+                db,
+                inbox=inbox,
+                parsed=parsed,
+                message_pk=message_id,
+                thread_key=thread_id,
+            )
+            if created and changed:
+                touched.add(changed)
+    return touched
+
+
 async def _cleanup_thread_if_empty(db: AsyncSession, inbox_id: int, thread_id: str) -> None:
     count_res = await db.execute(
         select(func.count())
@@ -2187,6 +2270,7 @@ async def list_unibox_conversations(
             SmtpThread.is_lead_thread,
             SmtpThread.unread_lead_reply,
             Inbox.email.label("account_email"),
+            Inbox.provider.label("provider"),
             smtp_latest_msg_sq.c.snippet.label("last_snippet"),
             lead_sq.c.lead_email.label("lead_email"),
             lead_sq.c.lead_status.label("lead_status"),
@@ -2273,7 +2357,7 @@ async def list_unibox_conversations(
                 "unread_lead_reply": bool(row.unread_lead_reply),
                 "lead_email": row.lead_email or None,
                 "lead_status": row.lead_status or None,
-                "provider": "smtp",
+                "provider": row.provider,
             }
         )
 
@@ -2510,7 +2594,7 @@ async def get_thread_messages(
     # When the inbox is known, route straight to its provider mirror.
     _prov_row = await db.execute(select(Inbox.provider).where(Inbox.id == chosen_inbox_id))
     _prov = (_prov_row.scalar_one_or_none() or "gmail")
-    if _prov == "smtp":
+    if _prov in ("smtp", "zapbox"):
         return await _get_smtp_thread_messages(db, thread_id=thread_id, inbox_id=chosen_inbox_id)
     if _prov == "office365":
         return await _get_o365_thread_messages(db, thread_id=thread_id, inbox_id=chosen_inbox_id)
@@ -3196,7 +3280,7 @@ async def sync_single_inbox(inbox_id: int, reason: str = "scheduled") -> bool:
     hydrate_thread_ids: set[str] = set()
     try:
         async with AsyncSessionLocal() as db:
-            inbox_res = await db.execute(select(Inbox).where(Inbox.id == inbox_id, Inbox.provider.in_(["gmail", "office365", "smtp"])))
+            inbox_res = await db.execute(select(Inbox).where(Inbox.id == inbox_id, Inbox.provider.in_(["gmail", "office365", "smtp", "zapbox"])))
             inbox = inbox_res.scalar_one_or_none()
             if not inbox:
                 await db.rollback()
@@ -3206,6 +3290,9 @@ async def sync_single_inbox(inbox_id: int, reason: str = "scheduled") -> bool:
                 hydrate_thread_ids = set()
             elif inbox.provider == "smtp":
                 touched = await _sync_inbox_smtp(db, inbox, reason)
+                hydrate_thread_ids = set()
+            elif inbox.provider == "zapbox":
+                touched = await _sync_inbox_zapbox(db, inbox, reason)
                 hydrate_thread_ids = set()
             else:
                 touched, hydrate_thread_ids = await _sync_inbox(db, inbox, reason)
@@ -3248,7 +3335,7 @@ async def backfill_single_inbox(
     touched: set[tuple[int, str]] = set()
     try:
         async with AsyncSessionLocal() as db:
-            inbox_res = await db.execute(select(Inbox).where(Inbox.id == inbox_id, Inbox.provider.in_(["gmail", "office365", "smtp"])))
+            inbox_res = await db.execute(select(Inbox).where(Inbox.id == inbox_id, Inbox.provider.in_(["gmail", "office365", "smtp", "zapbox"])))
             inbox = inbox_res.scalar_one_or_none()
             if not inbox:
                 await db.rollback()
@@ -3260,6 +3347,9 @@ async def backfill_single_inbox(
             elif inbox.provider == "smtp":
                 # IMAP has no date-window backfill API here; re-use full sync
                 touched = await _sync_inbox_smtp(db, inbox, reason)
+                _meta = {}
+            elif inbox.provider == "zapbox":
+                touched = await _sync_inbox_zapbox(db, inbox, reason)
                 _meta = {}
             else:
                 touched, _meta = await _backfill_older_window(db, inbox, window_days=window_days)
@@ -3285,7 +3375,7 @@ async def backfill_single_inbox(
 
 async def sync_all_inboxes(reason: str = "scheduled") -> int:
     async with AsyncSessionLocal() as db:
-        rows = await db.execute(select(Inbox.id).where(Inbox.provider.in_(["gmail", "office365", "smtp"])))
+        rows = await db.execute(select(Inbox.id).where(Inbox.provider.in_(["gmail", "office365", "smtp", "zapbox"])))
         inbox_ids = [row[0] for row in rows.all()]
 
     synced = 0

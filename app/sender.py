@@ -44,6 +44,20 @@ from app.routers.office365_oauth import refresh_access_token as refresh_office36
 log = logging.getLogger("quickly.sender")
 
 
+def unresolved_placeholders(subject: str, body: str) -> list[str]:
+    """List unresolved template variables in rendered email content."""
+    return sorted(set(re.findall(r"{{\s*([^{}]+?)\s*}}", subject + "\n" + body)))
+
+
+def zapbox_html_body(body: str, is_html: bool) -> str:
+    """Zapbox accepts HTML bodies; preserve plain text line breaks safely."""
+    if is_html:
+        return body
+    import html
+
+    return "<div>" + html.escape(body).replace("\n", "<br>") + "</div>"
+
+
 @dataclass
 class SendResult:
     """Returned by send_email with IDs needed for threading."""
@@ -866,6 +880,24 @@ def send_email(
             message_id=fake_id,
             thread_id=thread_id or conversation_id or "fake-thread",
         )
+
+    if provider == "zapbox":
+        from app.zapbox import ZapboxError, ZapboxAmbiguousSend, send_message
+
+        if unresolved_placeholders(subject, body):
+            return SendFailure(error_type="permission_denied", message="Unresolved template variables")
+        try:
+            result = send_message(
+                account=from_email, to=to_email, subject=subject,
+                body=zapbox_html_body(body, is_html),
+                from_name=from_name,
+                thread_id=thread_id, message_id=reply_to_msg_id,
+            )
+        except ZapboxAmbiguousSend:
+            return SendFailure(error_type="unknown", message="Zapbox send outcome needs reconciliation")
+        except ZapboxError as exc:
+            return SendFailure(error_type="permission_denied", message=str(exc))
+        return SendResult(message_id=result["messageId"], thread_id=result["threadId"])
 
     if provider == "smtp":
         if not smtp_account:

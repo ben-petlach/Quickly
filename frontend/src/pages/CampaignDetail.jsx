@@ -2460,7 +2460,7 @@ function SequenceBodyEditor({ value, onChange, isHtml, onIsHtmlChange, previewTe
 }
 
 // ─── Preview Modal ────────────────────────────────────────────────────────────
-function PreviewModal({ sequence, campaignId, leads, onClose, variant = null, editingOverride = null }) {
+function PreviewModal({ sequence, campaignId, leads, onClose, variant = null, editingOverride = null, testSendsDisabled = false }) {
   const [leadId,    setLeadId]    = useState(leads[0]?.lead_id ?? '');
   const [preview,   setPreview]   = useState(null);
   const [loading,   setLoading]   = useState(false);
@@ -2500,7 +2500,7 @@ function PreviewModal({ sequence, campaignId, leads, onClose, variant = null, ed
   useEffect(() => { load(); }, [load]);
 
   const sendTest = async () => {
-    if (!testEmail.trim()) return;
+    if (!testEmail.trim() || preview?.missing_placeholders?.length) return;
     setTestState('sending');
     try {
       await api.post(`/campaigns/${campaignId}/send-test`, {
@@ -2572,6 +2572,11 @@ function PreviewModal({ sequence, campaignId, leads, onClose, variant = null, ed
           {err && <div className="text-red-600 text-sm">{err}</div>}
           {preview && !loading && (
             <div className="space-y-4">
+              {preview.missing_placeholders?.length > 0 && (
+                <p className="rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+                  Missing contact values: {preview.missing_placeholders.join(', ')}. Complete these before sending.
+                </p>
+              )}
               {/* Subject */}
               <div className="bg-gray-50 rounded-lg px-4 py-3">
                 <span className="text-xs font-semibold text-gray-500 uppercase tracking-wide block mb-1">Subject</span>
@@ -2601,7 +2606,9 @@ function PreviewModal({ sequence, campaignId, leads, onClose, variant = null, ed
 
         {/* Footer: test email + close */}
         <div className="px-6 py-3 border-t space-y-2">
-          <div className="flex flex-wrap items-center gap-2">
+          {testSendsDisabled ? (
+            <p className="text-sm text-gray-500">Zapbox test sends are disabled during this pilot.</p>
+          ) : <div className="flex flex-wrap items-center gap-2">
             <span className="text-sm font-medium text-gray-600 whitespace-nowrap">Send test to:</span>
             <input
               type="email"
@@ -2615,7 +2622,7 @@ function PreviewModal({ sequence, campaignId, leads, onClose, variant = null, ed
               size="sm"
               variant="default"
               onClick={sendTest}
-              disabled={testState === 'sending' || !testEmail.trim()}
+              disabled={testState === 'sending' || !testEmail.trim() || !!preview?.missing_placeholders?.length}
             >
               {testState === 'sending' ? 'Sending…' : 'Send test'}
             </Button>
@@ -2625,7 +2632,7 @@ function PreviewModal({ sequence, campaignId, leads, onClose, variant = null, ed
             {testState?.error && (
               <span className="text-xs text-red-600">{testState.error}</span>
             )}
-          </div>
+          </div>}
           <div className="flex justify-end">
             <Button variant="outline" size="sm" onClick={onClose}>Close</Button>
           </div>
@@ -3599,7 +3606,7 @@ function SequencesTab({ sequences, campaignId, campaign, leads, refresh }) {
       )}
 
       {previewSeq && (
-        <PreviewModal sequence={previewSeq} campaignId={campaignId} leads={leads} variant={previewVariant} editingOverride={previewOverride} onClose={() => { setPreviewSeq(null); setPreviewVariant(null); setPreviewOverride(null); }} />
+        <PreviewModal sequence={previewSeq} campaignId={campaignId} leads={leads} variant={previewVariant} editingOverride={previewOverride} testSendsDisabled={inboxes.some(inbox => inbox.id === campaign?.inbox_ids?.[0] && inbox.provider === 'zapbox')} onClose={() => { setPreviewSeq(null); setPreviewVariant(null); setPreviewOverride(null); }} />
       )}
 
       {customEmailTarget && (
