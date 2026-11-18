@@ -679,7 +679,9 @@ async def run_send_job():
                                 _rendered_prev = _prev_log.body
                             else:
                                 _rendered_prev = render_body(_prev_body_raw, get_lead_data(lead), context=render_ctx)
-                            if _prev_is_html_raw:
+                            if inbox.provider == "zapbox" and getattr(_prev_log, "body", None):
+                                prev_email_body_html = _rendered_prev
+                            elif _prev_is_html_raw:
                                 prev_email_body_html = _rendered_prev
                             else:
                                 prev_email_body_plain = _rendered_prev
@@ -1566,7 +1568,9 @@ async def send_slot_job(slot_id: int) -> None:
                         _rendered_prev = _prev_log.body
                     else:
                         _rendered_prev = render_body(_prev_body_raw, get_lead_data(lead), context=render_ctx)
-                    if _prev_is_html_raw:
+                    if inbox.provider == "zapbox" and getattr(_prev_log, "body", None):
+                        prev_email_body_html = _rendered_prev
+                    elif _prev_is_html_raw:
                         prev_email_body_html = _rendered_prev
                     else:
                         prev_email_body_plain = _rendered_prev

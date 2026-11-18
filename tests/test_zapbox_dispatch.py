@@ -89,3 +89,53 @@ async def test_zapbox_dispatch_records_attempt_before_post_and_blocks_repeat(eng
     # Each invocation opens a fresh DB session, matching restart behavior.
     await jobs.send_slot_job(slot_id)
     assert post.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_zapbox_plain_followup_quotes_prior_html_as_text(engine, monkeypatch):
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with session_factory() as session:
+        inbox = await make_inbox(session, email="sender@example.test", provider="zapbox")
+        campaign = await make_campaign(session, sending_days=list(range(7)),
+                                       sending_hours_start="00:00", sending_hours_end="23:59")
+        lead = await make_lead(session, email="owned@example.test", name="Ben")
+        enrollment = await make_campaign_lead(session, campaign.id, lead.id)
+        await make_campaign_inbox(session, campaign.id, inbox.id)
+        await make_sequence(session, campaign.id, position=0, subject="Pilot",
+                            body="Hi Ben,\nfirst < note")
+        await make_sequence(session, campaign.id, position=1, subject="",
+                            body="Following up")
+        session.add(EmailLog(
+            lead_id=lead.id, campaign_id=campaign.id, inbox_id=inbox.id,
+            sequence_index=0, subject="Pilot", body="<div>Hi Ben,<br>first &lt; note</div>",
+            message_id="<first@example.test>", thread_id="thread-one",
+            sent_at=now() - timedelta(days=1),
+        ))
+        slot = QueueSlot(campaign_lead_id=enrollment.id, inbox_id=inbox.id,
+                         sequence_index=1, scheduled_date=now() - timedelta(minutes=1),
+                         position_in_day=1)
+        session.add(slot)
+        await session.flush()
+        digest = await snapshot_hash(session, enrollment, lead, campaign)
+        session.add(ZapboxLaunchSnapshot(campaign_lead_id=enrollment.id, content_hash=digest))
+        slot_id = slot.id
+        await session.commit()
+
+    async def synced(*args, **kwargs):
+        return True
+
+    post = Mock(return_value=SendResult("<second@example.test>", "thread-one"))
+    monkeypatch.setattr(jobs, "AsyncSessionLocal", session_factory)
+    monkeypatch.setattr(unibox, "sync_single_inbox", synced)
+    monkeypatch.setattr(jobs, "send_email", post)
+    monkeypatch.setattr(jobs.settings, "test_mode", False)
+
+    await jobs.send_slot_job(slot_id)
+    assert post.call_count == 1
+    sent = post.call_args.kwargs
+    assert sent["thread_id"] == "thread-one"
+    assert sent["reply_to_msg_id"] == "<first@example.test>"
+    assert "Hi Ben," in sent["body"]
+    assert "first < note" in sent["body"]
+    assert "<div>Hi Ben" not in sent["body"]
+    assert "&lt;" not in sent["body"]
